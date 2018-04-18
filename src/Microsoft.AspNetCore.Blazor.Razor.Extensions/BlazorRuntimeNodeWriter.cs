@@ -3,10 +3,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using AngleSharp;
-using AngleSharp.Html;
 using AngleSharp.Parser.Html;
 using Microsoft.AspNetCore.Razor.Language;
 using Microsoft.AspNetCore.Razor.Language.CodeGeneration;
@@ -19,35 +19,13 @@ namespace Microsoft.AspNetCore.Blazor.Razor
     /// </summary>
     internal class BlazorRuntimeNodeWriter : BlazorNodeWriter
     {
-        // Per the HTML spec, the following elements are inherently self-closing
-        // For example, <img> is the same as <img /> (and therefore it cannot contain descendants)
-        private readonly static HashSet<string> htmlVoidElementsLookup
-            = new HashSet<string>(
-                new[] { "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr" },
-                StringComparer.OrdinalIgnoreCase);
-
+        private readonly List<IntermediateToken> _currentAttributeValues = new List<IntermediateToken>();
         private readonly ScopeStack _scopeStack = new ScopeStack();
-        private string _unconsumedHtml;
-        private List<IntermediateToken> _currentAttributeValues;
-        private IDictionary<string, PendingAttribute> _currentElementAttributes = new Dictionary<string, PendingAttribute>();
         private int _sourceSequence = 0;
-
-        private struct PendingAttribute
-        {
-            public List<IntermediateToken> Values { get; set; }
-        }
 
         public override void WriteCSharpCode(CodeRenderingContext context, CSharpCodeIntermediateNode node)
         {
-            if (context == null)
-            {
-                throw new ArgumentNullException(nameof(context));
-            }
-
-            if (node == null)
-            {
-                throw new ArgumentNullException(nameof(node));
-            }
+            EnsureState<CSharpCodeIntermediateNode>(State.Normal);
 
             var isWhitespaceStatement = true;
             for (var i = 0; i < node.Children.Count; i++)
@@ -100,22 +78,6 @@ namespace Microsoft.AspNetCore.Blazor.Razor
             }
         }
 
-        public override void WriteCSharpCodeAttributeValue(CodeRenderingContext context, CSharpCodeAttributeValueIntermediateNode node)
-        {
-            if (_currentAttributeValues == null)
-            {
-                throw new InvalidOperationException($"Invoked {nameof(WriteCSharpCodeAttributeValue)} while {nameof(_currentAttributeValues)} was null.");
-            }
-
-            // We used to support syntaxes like <elem onsomeevent=@{ /* some C# code */ } /> but this is no longer the 
-            // case.
-            //
-            // We provide an error for this case just to be friendly.
-            var content = string.Join("", node.Children.OfType<IntermediateToken>().Select(t => t.Content));
-            context.Diagnostics.Add(BlazorDiagnosticFactory.Create_CodeBlockInAttribute(node.Source, content));
-            return;
-        }
-
         public override void WriteCSharpExpression(CodeRenderingContext context, CSharpExpressionIntermediateNode node)
         {
             // We used to support syntaxes like <elem @completeAttributePair /> but this is no longer the case.
@@ -123,12 +85,14 @@ namespace Microsoft.AspNetCore.Blazor.Razor
             // anyway.
             // 
             // We provide an error for this case just to be friendly.
-            if (_unconsumedHtml != null)
+            if (CurrentState == State.InsideTagHeader)
             {
                 var content = string.Join("", node.Children.OfType<IntermediateToken>().Select(t => t.Content));
                 context.Diagnostics.Add(BlazorDiagnosticFactory.Create_ExpressionInAttributeList(node.Source, content));
                 return;
             }
+
+            EnsureState<CSharpExpressionIntermediateNode>(State.Normal);
 
             // Since we're not in the middle of writing an element, this must evaluate as some
             // text to display
@@ -157,11 +121,6 @@ namespace Microsoft.AspNetCore.Blazor.Razor
 
         public override void WriteCSharpExpressionAttributeValue(CodeRenderingContext context, CSharpExpressionAttributeValueIntermediateNode node)
         {
-            if (_currentAttributeValues == null)
-            {
-                throw new InvalidOperationException($"Invoked {nameof(WriteCSharpCodeAttributeValue)} while {nameof(_currentAttributeValues)} was null.");
-            }
-
             // In cases like "somestring @variable", Razor tokenizes it as:
             //  [0] HtmlContent="somestring"
             //  [1] CsharpContent="variable" Prefix=" "
@@ -177,133 +136,61 @@ namespace Microsoft.AspNetCore.Blazor.Razor
             }
         }
 
+        public override void WriteHtmlElement(CodeRenderingContext context, HtmlElementIntermediateNode node)
+        {
+            context.CodeWriter
+                .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{nameof(BlazorApi.RenderTreeBuilder.OpenElement)}")
+                .Write((_sourceSequence++).ToString())
+                .WriteParameterSeparator()
+                .WriteStringLiteral(node.TagName)
+                .WriteEndMethodInvocation();
+
+            // Render Attributes.
+
+            _scopeStack.OpenScope(tagName: nextTag.Data, isComponent: false);
+
+            context.RenderChildren(node);
+
+            _scopeStack.CloseScope(
+                        context: context,
+                        tagName: nextTag.Data,
+                        isComponent: false,
+                        source: CalculateSourcePosition(node.Source, nextToken.Position));
+            codeWriter
+                .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{BlazorApi.RenderTreeBuilder.CloseElement}")
+                .WriteEndMethodInvocation();
+        }
+
         public override void WriteHtmlAttribute(CodeRenderingContext context, HtmlAttributeIntermediateNode node)
         {
-            _currentAttributeValues = new List<IntermediateToken>();
+            CurrentState = State.InsideAttribute;
+
+            Debug.Assert(_currentAttributeValues.Count == 0);
             context.RenderChildren(node);
-            _currentElementAttributes[node.AttributeName] = new PendingAttribute
-            {
-                Values = _currentAttributeValues,
-            };
-            _currentAttributeValues = null;
+
+            WriteAttribute(context.CodeWriter, node.AttributeName, _currentAttributeValues);
+            _currentAttributeValues.Clear();
+
+            CurrentState = State.InsideTagHeader;
         }
 
         public override void WriteHtmlAttributeValue(CodeRenderingContext context, HtmlAttributeValueIntermediateNode node)
         {
-            if (_currentAttributeValues == null)
-            {
-                throw new InvalidOperationException($"Invoked {nameof(WriteHtmlAttributeValue)} while {nameof(_currentAttributeValues)} was null.");
-            }
-
             var stringContent = ((IntermediateToken)node.Children.Single()).Content;
             _currentAttributeValues.Add(new IntermediateToken() { Kind = TokenKind.Html, Content = node.Prefix + stringContent, });
         }
 
         public override void WriteHtmlContent(CodeRenderingContext context, HtmlContentIntermediateNode node)
         {
-            var originalHtmlContent = GetContent(node);
-            if (_unconsumedHtml != null)
-            {
-                originalHtmlContent = _unconsumedHtml + originalHtmlContent;
-                _unconsumedHtml = null;
-            }
-
-            var tokenizer = new HtmlTokenizer(
-                new TextSource(originalHtmlContent),
-                HtmlEntityService.Resolver);
-            var codeWriter = context.CodeWriter;
-
-            // TODO: As an optimization, identify static subtrees (i.e., HTML elements in the Razor source
-            // that contain no C#) and represent them as a new RenderTreeFrameType called StaticElement or
-            // similar. This means you can have arbitrarily deep static subtrees without paying any per-
-            // node cost during rendering or diffing.
-            HtmlToken nextToken;
-            while ((nextToken = tokenizer.Get()).Type != HtmlTokenType.EndOfFile)
-            {
-                switch (nextToken.Type)
-                {
-                    case HtmlTokenType.Character:
-                        {
-                            // Text node
-                            _scopeStack.IncrementCurrentScopeChildCount(context);
-                            codeWriter
-                                .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{nameof(BlazorApi.RenderTreeBuilder.AddContent)}")
-                                .Write((_sourceSequence++).ToString())
-                                .WriteParameterSeparator()
-                                .WriteStringLiteral(nextToken.Data)
-                                .WriteEndMethodInvocation();
-                            break;
-                        }
-
-                    case HtmlTokenType.StartTag:
-                    case HtmlTokenType.EndTag:
-                        {
-                            var nextTag = nextToken.AsTag();
-                            var tagNameOriginalCase = GetTagNameWithOriginalCase(originalHtmlContent, nextTag);
-
-                            if (nextToken.Type == HtmlTokenType.StartTag)
-                            {
-                                RejectDisallowedHtmlTags(node, nextTag);
-
-                                _scopeStack.IncrementCurrentScopeChildCount(context);
-
-                                codeWriter
-                                    .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{nameof(BlazorApi.RenderTreeBuilder.OpenElement)}")
-                                    .Write((_sourceSequence++).ToString())
-                                    .WriteParameterSeparator()
-                                    .WriteStringLiteral(nextTag.Data)
-                                    .WriteEndMethodInvocation();
- 
-                                foreach (var attribute in nextTag.Attributes)
-                                {
-                                    var token = new IntermediateToken() { Kind = TokenKind.Html, Content = attribute.Value };
-                                    WriteAttribute(codeWriter, attribute.Key, new[] { token });
-                                }
-
-                                if (_currentElementAttributes.Count > 0)
-                                {
-                                    foreach (var pair in _currentElementAttributes)
-                                    {
-                                        WriteAttribute(codeWriter, pair.Key, pair.Value.Values);
-                                    }
-                                    _currentElementAttributes.Clear();
-                                }
-
-                                _scopeStack.OpenScope( tagName: nextTag.Data, isComponent: false);
-                            }
-
-                            if (nextToken.Type == HtmlTokenType.EndTag
-                                || nextTag.IsSelfClosing
-                                || htmlVoidElementsLookup.Contains(nextTag.Data))
-                            {
-                                _scopeStack.CloseScope(
-                                    context: context,
-                                    tagName: nextTag.Data,
-                                    isComponent: false,
-                                    source: CalculateSourcePosition(node.Source, nextToken.Position));
-                                codeWriter
-                                    .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{BlazorApi.RenderTreeBuilder.CloseElement}")
-                                    .WriteEndMethodInvocation();
-                            }
-                            break;
-                        }
-
-                    case HtmlTokenType.Comment:
-                        break;
-
-                    default:
-                        throw new InvalidCastException($"Unsupported token type: {nextToken.Type.ToString()}");
-                }
-            }
-
-            // If we got an EOF in the middle of an HTML element, it's probably because we're
-            // about to receive some attribute name/value pairs. Store the unused HTML content
-            // so we can prepend it to the part that comes after the attributes to make
-            // complete valid markup.
-            if (originalHtmlContent.Length > nextToken.Position.Position)
-            {
-                _unconsumedHtml = originalHtmlContent.Substring(nextToken.Position.Position - 1);
-            }
+            // Text node
+            var content = GetHtmlContent(node);
+            _scopeStack.IncrementCurrentScopeChildCount(context);
+            context.CodeWriter
+                .WriteStartMethodInvocation($"{_scopeStack.BuilderVarName}.{nameof(BlazorApi.RenderTreeBuilder.AddContent)}")
+                .Write((_sourceSequence++).ToString())
+                .WriteParameterSeparator()
+                .WriteStringLiteral(content)
+                .WriteEndMethodInvocation();
         }
 
         private void RejectDisallowedHtmlTags(IntermediateNode node, HtmlTagToken tagToken)
@@ -479,7 +366,7 @@ namespace Microsoft.AspNetCore.Blazor.Razor
             {
                 throw new InvalidOperationException("Unexpected node type " + node.Children[0].GetType().FullName);
             }
-            
+
             context.CodeWriter.Write(");");
             context.CodeWriter.WriteLine();
         }
@@ -504,12 +391,6 @@ namespace Microsoft.AspNetCore.Blazor.Razor
             {
                 return null;
             }
-        }
-
-        private static string GetTagNameWithOriginalCase(string document, HtmlTagToken tagToken)
-        {
-            var offset = tagToken.Type == HtmlTokenType.EndTag ? 1 : 0; // For end tags, skip the '/'
-            return document.Substring(tagToken.Position.Position + offset, tagToken.Name.Length);
         }
 
         private void WriteAttribute(CodeWriter codeWriter, string key, IList<IntermediateToken> value)
@@ -538,7 +419,7 @@ namespace Microsoft.AspNetCore.Blazor.Razor
                 .WriteParameterSeparator();
         }
 
-        private static string GetContent(HtmlContentIntermediateNode node)
+        private static string GetHtmlContent(HtmlContentIntermediateNode node)
         {
             var builder = new StringBuilder();
             var htmlTokens = node.Children.OfType<IntermediateToken>().Where(t => t.IsHtml);
